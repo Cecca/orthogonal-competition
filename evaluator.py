@@ -78,12 +78,8 @@ CREATE TABLE IF NOT EXISTS runs (
     build_time_s        REAL,
     total_query_time_s  REAL,
     qps                 REAL,
-    latency_mean_ms     REAL,
-    latency_median_ms   REAL,
-    latency_p95_ms      REAL,
-    latency_p99_ms      REAL,
     peak_mem_mb         REAL,    -- container-level peak RSS (cgroup)
-    n_dist_build        INTEGER,
+    index_mem_mb        REAL,    -- difference post index - pre index peak RSS 
     n_dist_queries      INTEGER,
     avg_recall          REAL,
     extra_metrics       TEXT     -- JSON blob
@@ -104,15 +100,13 @@ def insert_run(conn: sqlite3.Connection, row: dict) -> int:
         INSERT INTO runs (
             team_name, docker_image, dataset, scenario, timestamp, status, error_message,
             build_time_s, total_query_time_s, qps,
-            latency_mean_ms, latency_median_ms, latency_p95_ms, latency_p99_ms,
-            peak_mem_mb, n_dist_build, n_dist_queries,
+            peak_mem_mb, index_mem_mb, n_dist_queries,
             avg_recall,
             extra_metrics
         ) VALUES (
             :team_name, :docker_image, :dataset, :scenario, :timestamp, :status, :error_message,
             :build_time_s, :total_query_time_s, :qps,
-            :latency_mean_ms, :latency_median_ms, :latency_p95_ms, :latency_p99_ms,
-            :peak_mem_mb, :n_dist_build, :n_dist_queries,
+            :peak_mem_mb, :index_mem_mb, :n_dist_queries,
             :avg_recall,
             :extra_metrics
         )
@@ -129,9 +123,7 @@ def _empty_row(team, image, dataset, scenario, timestamp) -> dict:
         scenario=scenario, timestamp=timestamp,
         status="failed", error_message=None,
         build_time_s=None, total_query_time_s=None, qps=None,
-        latency_mean_ms=None, latency_median_ms=None,
-        latency_p95_ms=None, latency_p99_ms=None,
-        peak_mem_mb=None, n_dist_build=None, n_dist_queries=None,
+        peak_mem_mb=None, index_mem_mb=None, n_dist_queries=None,
         avg_recall=None,
         extra_metrics=None,
     )
@@ -451,8 +443,8 @@ def evaluate(
                     pred_neighbors  = f["neighbors"][:]
                     build_time      = float(f["build_time"][()])
                     query_times     = f["query_times"][:]
-                    n_dist_build    = int(f["n_dist_build"][()])
                     n_dist_queries  = int(f["n_dist_queries"][()])
+                    index_mem_mb  = int(f["index_mem_mb"][()])
             except Exception as exc:
                 row["error_message"] = f"Failed to parse results.hdf5: {exc}"
                 insert_run(conn, row)
@@ -495,10 +487,7 @@ def evaluate(
                 continue
 
             # -- Metrics --
-            sv      = [k for k in k_values if k <= true_neighbors.shape[1]
-                       and k <= pred_neighbors.shape[1]]
             avg_recall = recalls(true_distances, predicted_distances, max_k).mean()
-            # recalls = compute_all_recalls(true_neighbors, pred_neighbors, sv)
             total_qt = float(query_times.sum())
             qps      = n_test / total_qt if total_qt > 0 else 0.0
             lat_ms   = query_times * 1e3
@@ -508,12 +497,8 @@ def evaluate(
                 build_time_s=build_time,
                 total_query_time_s=total_qt,
                 qps=qps,
-                latency_mean_ms=float(np.mean(lat_ms)),
-                latency_median_ms=float(np.median(lat_ms)),
-                latency_p95_ms=float(np.percentile(lat_ms, 95)),
-                latency_p99_ms=float(np.percentile(lat_ms, 99)),
-                n_dist_build=n_dist_build,
                 n_dist_queries=n_dist_queries,
+                index_mem_mb=index_mem_mb,
                 avg_recall=avg_recall,
                 extra_metrics=json.dumps({
                     "latency_ms": {
@@ -529,12 +514,11 @@ def evaluate(
 
             log.info(
                 "RESULT [%s]  QPS=%.1f  build=%.2fs  "
-                "median=%.3fms  p99=%.3fms  peak=%.0fMB  "
-                "dist_build=%d  dist_query=%d  avg_recall=%s",
+                "peak=%.0fMB  index_mem=%dMB "
+                "dist_query=%d  avg_recall=%s",
                 scenario_name, qps, build_time,
-                row["latency_median_ms"], row["latency_p99_ms"],
-                row["peak_mem_mb"] or 0,
-                n_dist_build, n_dist_queries, avg_recall,
+                row["peak_mem_mb"] or 0, index_mem_mb,
+                n_dist_queries, avg_recall,
             )
 
         run_id = insert_run(conn, row)

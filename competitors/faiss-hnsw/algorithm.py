@@ -13,7 +13,7 @@ import faiss
 class Algorithm:
 
     def __init__(self):
-        self._n_distances = 0   # cumulative distance counter – update in fit() and query()
+        self._n_distances = 0   # cumulative distance counter – update in query()
 
     def fit(self, train: np.ndarray, **index_params) -> None:
         self._index = faiss.IndexHNSWFlat(train.shape[1], index_params["M"])

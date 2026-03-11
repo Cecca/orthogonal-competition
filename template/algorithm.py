@@ -23,10 +23,9 @@ query(query, k, **query_params)
 
 get_n_distances() -> int
     Returns the CUMULATIVE number of distance computations performed
-    since this instance was created.  The harness calls this once
-    immediately after fit() and once after all queries have finished,
-    storing both values independently.  You are responsible for
-    incrementing an internal counter inside fit() and query().
+    since this instance was created.  The harness calls this
+    after all queries have finished.
+    You are responsible for incrementing an internal counter inside query().
 
 Rules
 -----
@@ -40,7 +39,7 @@ import numpy as np
 class Algorithm:
 
     def __init__(self):
-        self._n_distances = 0   # cumulative distance counter – update in fit() and query()
+        self._n_distances = 0   # cumulative distance counter – update in query()
 
     def fit(self, train: np.ndarray, **index_params) -> None:
         """

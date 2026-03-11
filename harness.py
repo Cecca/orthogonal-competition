@@ -32,8 +32,8 @@ Output HDF5 layout (flat – one file per container run):
   /neighbors       int32   (n_queries, k)  – predicted neighbor indices
   /build_time      float64 scalar          – seconds for fit()
   /query_times     float64 (n_queries,)    – per-query wall-clock seconds
-  /n_dist_build    int64   scalar          – distances computed during fit()
   /n_dist_queries  int64   scalar          – distances computed during all queries
+  /index_mem_mb    float64 scalar          – index memory in megabytes
 """
 
 import importlib.util
@@ -149,10 +149,9 @@ def main():
     t0 = time.perf_counter()
     algo.fit(train, **cfg["index_params"])
     build_time   = time.perf_counter() - t0
-    n_dist_build = int(algo.get_n_distances())
     end_mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    index_mem_kb = end_mem_kb - start_mem_kb
-    print(f"[harness] fit() done: {build_time:.4f}s  n_dist_build={n_dist_build} memory_kb={index_mem_kb}")
+    index_mem_mb = (end_mem_kb - start_mem_kb) / 1024
+    print(f"[harness] fit() done: {build_time:.4f}s memory_mb={index_mem_mb:.4f}Mb")
 
     # ------------------------------------------------------------------
     # Phase 2: queries, timed individually
@@ -165,7 +164,6 @@ def main():
         t0 = time.perf_counter()
         result = algo.query(queries[i], k=k, **cfg["query_params"])
         query_times[i] = time.perf_counter() - t0
-        print("[harness] query", i, "took", query_times[i], "s")
 
         result = np.asarray(result, dtype=np.int32)
         if result.shape != (k,):
@@ -175,7 +173,7 @@ def main():
             )
         neighbors[i] = result
 
-    n_dist_queries = int(algo.get_n_distances()) - n_dist_build
+    n_dist_queries = int(algo.get_n_distances())
     total = query_times.sum()
     print(
         f"[harness] queries done: total={total:.4f}s  QPS={n_queries/total:.1f}  "
@@ -192,8 +190,8 @@ def main():
         f.create_dataset("neighbors",      data=neighbors)
         f.create_dataset("build_time",     data=float(build_time))
         f.create_dataset("query_times",    data=query_times)
-        f.create_dataset("n_dist_build",   data=n_dist_build)
         f.create_dataset("n_dist_queries", data=n_dist_queries)
+        f.create_dataset("index_mem_mb", data=index_mem_mb)
 
     print(f"[harness] Results written to {results_path}")
 
