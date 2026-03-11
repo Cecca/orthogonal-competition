@@ -85,9 +85,7 @@ CREATE TABLE IF NOT EXISTS runs (
     peak_mem_mb         REAL,    -- container-level peak RSS (cgroup)
     n_dist_build        INTEGER,
     n_dist_queries      INTEGER,
-    recall_at_1         REAL,
-    recall_at_10        REAL,
-    recall_at_100       REAL,
+    avg_recall          REAL,
     extra_metrics       TEXT     -- JSON blob
 );
 """
@@ -108,14 +106,14 @@ def insert_run(conn: sqlite3.Connection, row: dict) -> int:
             build_time_s, total_query_time_s, qps,
             latency_mean_ms, latency_median_ms, latency_p95_ms, latency_p99_ms,
             peak_mem_mb, n_dist_build, n_dist_queries,
-            recall_at_1, recall_at_10, recall_at_100,
+            avg_recall,
             extra_metrics
         ) VALUES (
             :team_name, :docker_image, :dataset, :scenario, :timestamp, :status, :error_message,
             :build_time_s, :total_query_time_s, :qps,
             :latency_mean_ms, :latency_median_ms, :latency_p95_ms, :latency_p99_ms,
             :peak_mem_mb, :n_dist_build, :n_dist_queries,
-            :recall_at_1, :recall_at_10, :recall_at_100,
+            :avg_recall,
             :extra_metrics
         )
         """,
@@ -134,7 +132,7 @@ def _empty_row(team, image, dataset, scenario, timestamp) -> dict:
         latency_mean_ms=None, latency_median_ms=None,
         latency_p95_ms=None, latency_p99_ms=None,
         peak_mem_mb=None, n_dist_build=None, n_dist_queries=None,
-        recall_at_1=None, recall_at_10=None, recall_at_100=None,
+        avg_recall=None,
         extra_metrics=None,
     )
 
@@ -153,9 +151,21 @@ def recall_at_k(true_neighbors: np.ndarray, pred_neighbors: np.ndarray, k: int) 
     return hits / (n * k)
 
 
-def compute_all_recalls(true_nb, pred_nb, k_values):
-    max_k = min(true_nb.shape[1], pred_nb.shape[1])
-    return {k: recall_at_k(true_nb, pred_nb, k) for k in k_values if k <= max_k}
+def recalls(true_distances: np.ndarray, predicted_distances: np.ndarray, k: int) -> np.ndarray:
+    def compute_recall(td, pd):
+        pd = pd[:k]
+        threshold = td[k-1]
+        return np.mean(pd <= threshold)
+    return np.array([
+        compute_recall(true_distances[i], predicted_distances[i])
+        for i in range(true_distances.shape[0])
+    ])
+
+
+
+# def compute_all_recalls(true_nb, pred_nb, k_values):
+#     max_k = min(true_nb.shape[1], pred_nb.shape[1])
+#     return {k: recall_at_k(true_nb, pred_nb, k) for k in k_values if k <= max_k}
 
 
 # ---------------------------------------------------------------------------
@@ -449,10 +459,29 @@ def evaluate(
                 results.append(row)
                 continue
 
+            # Compute distances
+            with h5py.File(dataset_path) as f:
+                data = f["train"][:]
+                queries = f["test"][:]
+                true_distances = f["distances"][:]
+                predicted_distances = np.array(
+                    [
+                        np.linalg.norm(data[pred_neighbors[i]] - queries[i], axis=1)
+                        for i in range(queries.shape[0])
+                    ]
+                )
+            
             # Shape checks
             if pred_neighbors.shape[0] != n_test:
                 row["error_message"] = (
                     f"'neighbors' has {pred_neighbors.shape[0]} rows, expected {n_test}."
+                )
+                insert_run(conn, row)
+                results.append(row)
+                continue
+            if predicted_distances.shape[0] != n_test:
+                row["error_message"] = (
+                    f"'predicted_distances' has {predicted_distances.shape[0]} rows, expected {n_test}."
                 )
                 insert_run(conn, row)
                 results.append(row)
@@ -468,7 +497,8 @@ def evaluate(
             # -- Metrics --
             sv      = [k for k in k_values if k <= true_neighbors.shape[1]
                        and k <= pred_neighbors.shape[1]]
-            recalls = compute_all_recalls(true_neighbors, pred_neighbors, sv)
+            avg_recall = recalls(true_distances, predicted_distances, max_k).mean()
+            # recalls = compute_all_recalls(true_neighbors, pred_neighbors, sv)
             total_qt = float(query_times.sum())
             qps      = n_test / total_qt if total_qt > 0 else 0.0
             lat_ms   = query_times * 1e3
@@ -484,11 +514,8 @@ def evaluate(
                 latency_p99_ms=float(np.percentile(lat_ms, 99)),
                 n_dist_build=n_dist_build,
                 n_dist_queries=n_dist_queries,
-                recall_at_1=recalls.get(1),
-                recall_at_10=recalls.get(10),
-                recall_at_100=recalls.get(100),
+                avg_recall=avg_recall,
                 extra_metrics=json.dumps({
-                    "recall": {str(k): v for k, v in recalls.items()},
                     "latency_ms": {
                         "mean":   float(np.mean(lat_ms)),
                         "median": float(np.median(lat_ms)),
@@ -500,15 +527,14 @@ def evaluate(
                 }),
             )
 
-            recall_str = "  ".join(f"R@{k}={v:.4f}" for k, v in sorted(recalls.items()))
             log.info(
                 "RESULT [%s]  QPS=%.1f  build=%.2fs  "
                 "median=%.3fms  p99=%.3fms  peak=%.0fMB  "
-                "dist_build=%d  dist_query=%d  %s",
+                "dist_build=%d  dist_query=%d  avg_recall=%s",
                 scenario_name, qps, build_time,
                 row["latency_median_ms"], row["latency_p99_ms"],
                 row["peak_mem_mb"] or 0,
-                n_dist_build, n_dist_queries, recall_str,
+                n_dist_build, n_dist_queries, avg_recall,
             )
 
         run_id = insert_run(conn, row)
@@ -549,12 +575,12 @@ def print_leaderboard(conn, dataset=None, scenario=None):
 
     rows = conn.execute(
         f"""
-        SELECT team_name, dataset, scenario, recall_at_10, qps,
+        SELECT team_name, dataset, scenario, avg_recall, qps,
                latency_median_ms, latency_p99_ms, build_time_s,
                peak_mem_mb, n_dist_build, n_dist_queries
         FROM   runs
         {where}
-        ORDER  BY scenario, recall_at_10 DESC, qps DESC
+        ORDER  BY scenario, avg_recall DESC, qps DESC
         """,
         params,
     ).fetchall()
@@ -565,7 +591,7 @@ def print_leaderboard(conn, dataset=None, scenario=None):
 
     header = (
         f"{'Rank':<5} {'Team':<18} {'Scenario':<18} "
-        f"{'R@10':>7} {'QPS':>9} {'Med ms':>8} {'P99 ms':>8} "
+        f"{'Recall':>7} {'QPS':>9} {'Med ms':>8} {'P99 ms':>8} "
         f"{'Bld s':>7} {'Mem MB':>8} {'DistBld':>10} {'DistQry':>10}"
     )
     sep = "-" * len(header)
@@ -580,7 +606,7 @@ def print_leaderboard(conn, dataset=None, scenario=None):
 
     current_scenario = None
     rank = 0
-    for team, ds, scen, rec10, qps, med, p99, build, mem, nd_b, nd_q in rows:
+    for team, ds, scen, recall, qps, med, p99, build, mem, nd_b, nd_q in rows:
         if scen != current_scenario:
             if current_scenario is not None:
                 print(sep)
@@ -589,7 +615,7 @@ def print_leaderboard(conn, dataset=None, scenario=None):
         rank += 1
         print(
             f"{rank:<5} {team:<18} {scen:<18} "
-            f"{_f(rec10,'.4f'):>7} {_f(qps,'.1f'):>9} "
+            f"{_f(recall,'.4f'):>7} {_f(qps,'.1f'):>9} "
             f"{_f(med,'.3f'):>8} {_f(p99,'.3f'):>8} "
             f"{_f(build,'.2f'):>7} {_f(mem,'.0f'):>8} "
             f"{_f(nd_b,'d') if nd_b is not None else 'N/A':>10} "

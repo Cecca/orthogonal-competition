@@ -1,10 +1,3 @@
-# -----------------------------------------------------------------------
-# NNS Competition – Student Dockerfile
-#
-# Build and push:
-#   docker build -t <your-team>/nns:latest .
-# -----------------------------------------------------------------------
-
 FROM ann-orthogonal/base:latest
 
 # ---- Install your algorithm's dependencies ----
