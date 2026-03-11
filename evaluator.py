@@ -143,6 +143,7 @@ def _empty_row(team, image, dataset, scenario, timestamp) -> dict:
 # Metrics
 # ---------------------------------------------------------------------------
 
+# TODO: change how we compute the recall
 def recall_at_k(true_neighbors: np.ndarray, pred_neighbors: np.ndarray, k: int) -> float:
     n = true_neighbors.shape[0]
     hits = sum(

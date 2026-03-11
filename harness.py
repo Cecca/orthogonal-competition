@@ -40,6 +40,7 @@ import importlib.util
 import os
 import time
 import traceback
+import resource
 
 import h5py
 import numpy as np
@@ -143,12 +144,15 @@ def main():
     # ------------------------------------------------------------------
     # Phase 1: index build
     # ------------------------------------------------------------------
+    start_mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print("[harness] Starting fit() ...")
     t0 = time.perf_counter()
     algo.fit(train, **cfg["index_params"])
     build_time   = time.perf_counter() - t0
     n_dist_build = int(algo.get_n_distances())
-    print(f"[harness] fit() done: {build_time:.4f}s  n_dist_build={n_dist_build}")
+    end_mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    index_mem_kb = end_mem_kb - start_mem_kb
+    print(f"[harness] fit() done: {build_time:.4f}s  n_dist_build={n_dist_build} memory_kb={index_mem_kb}")
 
     # ------------------------------------------------------------------
     # Phase 2: queries, timed individually
