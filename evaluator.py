@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""
+NNS Competition Evaluator
+=========================
+Evaluates student submissions for the nearest neighbor search competition.
+
+Each student provides a Docker image that inherits from nns-competition/base.
+Students implement algorithm.py (fit / query / get_n_distances) and
+scenarios.yaml (one entry per parameter configuration to evaluate).
+
+The evaluator:
+  1. Extracts scenarios.yaml from the image (without running it) to discover
+     scenario names.
+  2. Spawns one fresh container per scenario, passing SCENARIO_NAME so the
+     harness runs exactly that configuration.
+  3. While the container runs, polls Docker's memory stats in a background
+     thread to record the true peak RSS (cgroup-based, includes all C heap).
+  4. Reads the flat results.hdf5 written by the harness and computes metrics.
+  5. Stores one DB row per scenario.
+
+Usage
+-----
+  python evaluator.py evaluate --team alice --image alice/nns:latest \\
+                                --dataset data/sift-128-euclidean.hdf5
+  python evaluator.py batch    --config submissions.json \\
+                                --dataset data/sift-128-euclidean.hdf5
+  python evaluator.py leaderboard [--dataset NAME] [--scenario NAME]
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import logging
+import sqlite3
+import tarfile
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from icecream import ic
+
+import sys
+import docker
+import docker.errors
+import h5py
+import numpy as np
+import yaml
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEFAULT_DB      = "results.db"
+DEFAULT_TIMEOUT = 600          # seconds per container run
+CONTAINER_DATA_MOUNT    = "/competition/data"
+CONTAINER_RESULTS_MOUNT = "/competition/results"
+MEMORY_LIMIT = "8g"
+CPU_QUOTA    = 4 * 10**9       # 4 vCPUs in nano-CPUs
+MEM_POLL_INTERVAL = 0.5        # seconds between memory stat polls
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+_CREATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_name           TEXT    NOT NULL,
+    docker_image        TEXT    NOT NULL,
+    dataset             TEXT    NOT NULL,
+    scenario            TEXT    NOT NULL,
+    timestamp           TEXT    NOT NULL,
+    status              TEXT    NOT NULL,   -- 'success' | 'failed' | 'timeout'
+    error_message       TEXT,
+    build_time_s        REAL,
+    total_query_time_s  REAL,
+    qps                 REAL,
+    latency_mean_ms     REAL,
+    latency_median_ms   REAL,
+    latency_p95_ms      REAL,
+    latency_p99_ms      REAL,
+    peak_mem_mb         REAL,    -- container-level peak RSS (cgroup)
+    n_dist_build        INTEGER,
+    n_dist_queries      INTEGER,
+    recall_at_1         REAL,
+    recall_at_10        REAL,
+    recall_at_100       REAL,
+    extra_metrics       TEXT     -- JSON blob
+);
+"""
+
+
+def open_db(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path)
+    conn.execute(_CREATE_SCHEMA)
+    conn.commit()
+    return conn
+
+
+def insert_run(conn: sqlite3.Connection, row: dict) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO runs (
+            team_name, docker_image, dataset, scenario, timestamp, status, error_message,
+            build_time_s, total_query_time_s, qps,
+            latency_mean_ms, latency_median_ms, latency_p95_ms, latency_p99_ms,
+            peak_mem_mb, n_dist_build, n_dist_queries,
+            recall_at_1, recall_at_10, recall_at_100,
+            extra_metrics
+        ) VALUES (
+            :team_name, :docker_image, :dataset, :scenario, :timestamp, :status, :error_message,
+            :build_time_s, :total_query_time_s, :qps,
+            :latency_mean_ms, :latency_median_ms, :latency_p95_ms, :latency_p99_ms,
+            :peak_mem_mb, :n_dist_build, :n_dist_queries,
+            :recall_at_1, :recall_at_10, :recall_at_100,
+            :extra_metrics
+        )
+        """,
+        row,
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def _empty_row(team, image, dataset, scenario, timestamp) -> dict:
+    return dict(
+        team_name=team, docker_image=image, dataset=dataset,
+        scenario=scenario, timestamp=timestamp,
+        status="failed", error_message=None,
+        build_time_s=None, total_query_time_s=None, qps=None,
+        latency_mean_ms=None, latency_median_ms=None,
+        latency_p95_ms=None, latency_p99_ms=None,
+        peak_mem_mb=None, n_dist_build=None, n_dist_queries=None,
+        recall_at_1=None, recall_at_10=None, recall_at_100=None,
+        extra_metrics=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def recall_at_k(true_neighbors: np.ndarray, pred_neighbors: np.ndarray, k: int) -> float:
+    n = true_neighbors.shape[0]
+    hits = sum(
+        len(set(true_neighbors[i, :k].tolist()) & set(pred_neighbors[i, :k].tolist()))
+        for i in range(n)
+    )
+    return hits / (n * k)
+
+
+def compute_all_recalls(true_nb, pred_nb, k_values):
+    max_k = min(true_nb.shape[1], pred_nb.shape[1])
+    return {k: recall_at_k(true_nb, pred_nb, k) for k in k_values if k <= max_k}
+
+
+# ---------------------------------------------------------------------------
+# Scenario discovery
+# ---------------------------------------------------------------------------
+
+def extract_scenarios_yaml(client: docker.DockerClient, image: str) -> list[str]:
+    """
+    Extract /app/scenarios.yaml from the image without starting a container.
+
+    Returns a list of scenario names only – params are resolved at runtime by
+    the harness once it knows the dataset name.  Validates overall structure
+    so badly-formed submissions fail fast before any containers are started.
+
+    Expected schema:
+      scenarios:
+        <scenario_name>:
+          default:             # required fallback
+            index_params: {}
+            query_params: {}
+          <dataset_name>:      # optional dataset-specific override
+            index_params: {}
+            query_params: {}
+    """
+    log = logging.getLogger(__name__)
+    container = client.containers.create(image)
+    try:
+        stream, _ = container.get_archive("/app/scenarios.yaml")
+        buf = io.BytesIO(b"".join(stream))
+        with tarfile.open(fileobj=buf) as tar:
+            raw = tar.extractfile(tar.getmembers()[0]).read()
+        parsed = yaml.safe_load(raw)
+    finally:
+        container.remove(force=True)
+
+    if "scenarios" not in parsed or not isinstance(parsed["scenarios"], dict):
+        raise ValueError("scenarios.yaml must contain a top-level 'scenarios' mapping.")
+
+    scenario_names = []
+    for sname, sval in parsed["scenarios"].items():
+        if not isinstance(sname, str) or not sname.isidentifier():
+            raise ValueError(
+                f"Scenario name {sname!r} is invalid; "
+                "must be a non-empty string usable as a Python identifier."
+            )
+        sval = sval or {}
+        if not isinstance(sval, dict):
+            raise ValueError(f"Scenario {sname!r} must be a mapping.")
+        if "default" not in sval:
+            raise ValueError(
+                f"Scenario {sname!r} is missing a 'default' block. "
+                "Every scenario must have a 'default' fallback."
+            )
+        for block_name, block in sval.items():
+            block = block or {}
+            for key in ("index_params", "query_params"):
+                if key in block and not isinstance(block[key], (dict, type(None))):
+                    raise ValueError(
+                        f"Scenario {sname!r}, block {block_name!r}: "
+                        f"'{key}' must be a mapping."
+                    )
+        scenario_names.append(sname)
+
+    if not scenario_names:
+        raise ValueError("scenarios.yaml defines no scenarios.")
+
+    log.info("Discovered %d scenario(s): %s", len(scenario_names), ", ".join(scenario_names))
+    return scenario_names
+
+
+# ---------------------------------------------------------------------------
+# Memory polling
+# ---------------------------------------------------------------------------
+
+class PeakMemoryMonitor:
+    """
+    Polls container memory stats in a background thread.
+    Uses Docker's cgroup-based max_usage (true peak RSS, includes C heap).
+    """
+
+    def __init__(self, container, interval: float = MEM_POLL_INTERVAL):
+        self._container = container
+        self._interval  = interval
+        self._peak_mb   = 0.0
+        self._stop      = threading.Event()
+        self._thread    = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self) -> float:
+        self._stop.set()
+        self._thread.join()
+        return self._peak_mb
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                stats = self._container.stats(stream=False)
+                usage = stats.get("memory_stats", {}).get("usage", 0)
+                self._peak_mb = max(self._peak_mb, usage / (1024 ** 2))
+            except Exception:
+                pass
+            self._stop.wait(self._interval)
+
+
+# ---------------------------------------------------------------------------
+# Single-scenario container run
+# ---------------------------------------------------------------------------
+
+def run_scenario_container(
+    client: docker.DockerClient,
+    image: str,
+    data_dir: str,
+    results_dir: str,
+    dataset_filename: str,
+    dataset_name: str,
+    scenario_name: str,
+    k: int,
+    timeout: int,
+) -> dict:
+    """
+    Run one container for one scenario.
+    Returns: {status, peak_mem_mb, wall_time, error (optional)}
+    """
+    log = logging.getLogger(__name__)
+
+    volumes = {
+        str(Path(data_dir).resolve()): {
+            "bind": CONTAINER_DATA_MOUNT, "mode": "ro",
+        },
+        str(Path(results_dir).resolve()): {
+            "bind": CONTAINER_RESULTS_MOUNT, "mode": "rw",
+        },
+    }
+    environment = {
+        "DATASET_PATH":  f"{CONTAINER_DATA_MOUNT}/{dataset_filename}",
+        "RESULTS_PATH":  f"{CONTAINER_RESULTS_MOUNT}/results.hdf5",
+        "SCENARIO_NAME": scenario_name,
+        "DATASET_NAME":  dataset_name,
+        "QUERY_K":       str(k),
+    }
+
+    container = None
+    t0 = time.monotonic()
+    try:
+        container = client.containers.run(
+            image,
+            detach=True,
+            volumes=volumes,
+            environment=environment,
+            # mem_limit=MEMORY_LIMIT,
+            network_disabled=True,
+            remove=False,
+        )
+        log.info("Container %s started  [scenario=%s]", container.short_id, scenario_name)
+
+        monitor = PeakMemoryMonitor(container)
+        monitor.start()
+
+        try:
+            result = container.wait(timeout=timeout)
+            exit_code = result["StatusCode"]
+        except Exception as exc:
+            container.kill()
+            peak_mb = monitor.stop()
+            wall = time.monotonic() - t0
+            log.warning("Container timed out after %.0fs", wall)
+            return {"status": "timeout", "wall_time": wall,
+                    "peak_mem_mb": peak_mb, "error": str(exc)}
+
+        peak_mb = monitor.stop()
+        wall = time.monotonic() - t0
+
+        logs_tail = container.logs(
+            stdout=True, stderr=True
+        ).decode("utf-8", errors="replace")[-3000:]
+        print(logs_tail)
+
+        if exit_code != 0:
+            log.error("Container exited %d\n%s", exit_code, logs_tail)
+            return {
+                "status": "failed", "wall_time": wall, "peak_mem_mb": peak_mb,
+                "error": f"Exit code {exit_code}\n---\n{logs_tail}",
+            }
+
+        log.info("Container done in %.1fs  peak_mem=%.0fMB", wall, peak_mb)
+        return {"status": "success", "wall_time": wall, "peak_mem_mb": peak_mb}
+
+    finally:
+        if container:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Core evaluation pipeline
+# ---------------------------------------------------------------------------
+
+def evaluate(
+    conn: sqlite3.Connection,
+    client: docker.DockerClient,
+    team_name: str,
+    docker_image: str,
+    dataset_path: str,
+    k_values: list[int] = (1, 10, 100),
+    timeout: int = DEFAULT_TIMEOUT,
+) -> list[dict]:
+    log = logging.getLogger(__name__)
+    dataset_path = Path(dataset_path)
+    dataset_name = dataset_path.stem
+    timestamp    = datetime.now(timezone.utc).isoformat()
+
+    log.info("=" * 60)
+    log.info("Team: %s | Image: %s | Dataset: %s", team_name, docker_image, dataset_name)
+
+    # -- Discover scenarios from the image --
+    try:
+        scenarios = extract_scenarios_yaml(client, docker_image)
+    except Exception as exc:
+        row = _empty_row(team_name, docker_image, dataset_name, "__no_scenarios__", timestamp)
+        row["error_message"] = f"Could not read scenarios.yaml from image: {exc}"
+        insert_run(conn, row)
+        return [row]
+
+    # -- Load ground truth once --
+    log.info("Loading ground-truth from %s ...", dataset_path)
+    try:
+        with h5py.File(dataset_path, "r") as f:
+            true_neighbors = f["neighbors"][:]
+            n_test = f["test"].shape[0]
+    except Exception as exc:
+        row = _empty_row(team_name, docker_image, dataset_name, "__load_failed__", timestamp)
+        row["error_message"] = f"Failed to load dataset: {exc}"
+        insert_run(conn, row)
+        return [row]
+
+    max_k = max(k_values)
+    results = []
+
+    for scenario_name in scenarios:
+        log.info("--- Scenario: %s ---", scenario_name)
+        row = _empty_row(team_name, docker_image, dataset_name, scenario_name, timestamp)
+
+        with tempfile.TemporaryDirectory(prefix="nns_eval_") as tmpdir:
+            run_result = run_scenario_container(
+                client=client,
+                image=docker_image,
+                data_dir=str(dataset_path.parent),
+                results_dir=tmpdir,
+                dataset_filename=dataset_path.name,
+                dataset_name=dataset_name,
+                scenario_name=scenario_name,
+                k=max_k,
+                timeout=timeout,
+            )
+
+            row["peak_mem_mb"] = run_result.get("peak_mem_mb")
+
+            if run_result["status"] != "success":
+                row["status"]        = run_result["status"]
+                row["error_message"] = run_result.get("error")
+                run_id = insert_run(conn, row)
+                log.warning("Scenario %s: %s (id=%d)", scenario_name, row["status"], run_id)
+                results.append(row)
+                continue
+
+            # -- Parse results.hdf5 --
+            results_file = Path(tmpdir) / "results.hdf5"
+            if not results_file.exists():
+                row["error_message"] = (
+                    "results.hdf5 was not written. "
+                    "Ensure the harness entrypoint is not overridden."
+                )
+                insert_run(conn, row)
+                results.append(row)
+                continue
+
+            try:
+                with h5py.File(results_file, "r") as f:
+                    pred_neighbors  = f["neighbors"][:]
+                    build_time      = float(f["build_time"][()])
+                    query_times     = f["query_times"][:]
+                    n_dist_build    = int(f["n_dist_build"][()])
+                    n_dist_queries  = int(f["n_dist_queries"][()])
+            except Exception as exc:
+                row["error_message"] = f"Failed to parse results.hdf5: {exc}"
+                insert_run(conn, row)
+                results.append(row)
+                continue
+
+            # Shape checks
+            if pred_neighbors.shape[0] != n_test:
+                row["error_message"] = (
+                    f"'neighbors' has {pred_neighbors.shape[0]} rows, expected {n_test}."
+                )
+                insert_run(conn, row)
+                results.append(row)
+                continue
+            if query_times.shape[0] != n_test:
+                row["error_message"] = (
+                    f"'query_times' has {query_times.shape[0]} entries, expected {n_test}."
+                )
+                insert_run(conn, row)
+                results.append(row)
+                continue
+
+            # -- Metrics --
+            sv      = [k for k in k_values if k <= true_neighbors.shape[1]
+                       and k <= pred_neighbors.shape[1]]
+            recalls = compute_all_recalls(true_neighbors, pred_neighbors, sv)
+            total_qt = float(query_times.sum())
+            qps      = n_test / total_qt if total_qt > 0 else 0.0
+            lat_ms   = query_times * 1e3
+
+            row.update(
+                status="success",
+                build_time_s=build_time,
+                total_query_time_s=total_qt,
+                qps=qps,
+                latency_mean_ms=float(np.mean(lat_ms)),
+                latency_median_ms=float(np.median(lat_ms)),
+                latency_p95_ms=float(np.percentile(lat_ms, 95)),
+                latency_p99_ms=float(np.percentile(lat_ms, 99)),
+                n_dist_build=n_dist_build,
+                n_dist_queries=n_dist_queries,
+                recall_at_1=recalls.get(1),
+                recall_at_10=recalls.get(10),
+                recall_at_100=recalls.get(100),
+                extra_metrics=json.dumps({
+                    "recall": {str(k): v for k, v in recalls.items()},
+                    "latency_ms": {
+                        "mean":   float(np.mean(lat_ms)),
+                        "median": float(np.median(lat_ms)),
+                        "p95":    float(np.percentile(lat_ms, 95)),
+                        "p99":    float(np.percentile(lat_ms, 99)),
+                        "p999":   float(np.percentile(lat_ms, 99.9)),
+                        "max":    float(np.max(lat_ms)),
+                    },
+                }),
+            )
+
+            recall_str = "  ".join(f"R@{k}={v:.4f}" for k, v in sorted(recalls.items()))
+            log.info(
+                "RESULT [%s]  QPS=%.1f  build=%.2fs  "
+                "median=%.3fms  p99=%.3fms  peak=%.0fMB  "
+                "dist_build=%d  dist_query=%d  %s",
+                scenario_name, qps, build_time,
+                row["latency_median_ms"], row["latency_p99_ms"],
+                row["peak_mem_mb"] or 0,
+                n_dist_build, n_dist_queries, recall_str,
+            )
+
+        run_id = insert_run(conn, row)
+        log.info("Saved run id=%d  scenario=%s", run_id, scenario_name)
+        results.append(row)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Batch mode
+# ---------------------------------------------------------------------------
+
+def batch_evaluate(conn, client, config_path, dataset_path, timeout=DEFAULT_TIMEOUT):
+    with open(config_path) as f:
+        submissions = json.load(f)
+    log = logging.getLogger(__name__)
+    log.info("Batch: %d submission(s).", len(submissions))
+    for i, sub in enumerate(submissions, 1):
+        log.info("--- Submission %d/%d ---", i, len(submissions))
+        evaluate(conn=conn, client=client, team_name=sub["team"],
+                 docker_image=sub["image"], dataset_path=dataset_path,
+                 timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard
+# ---------------------------------------------------------------------------
+
+def print_leaderboard(conn, dataset=None, scenario=None):
+    clauses = ["status = 'success'"]
+    params  = []
+    if dataset:
+        clauses.append("dataset = ?");  params.append(dataset)
+    if scenario:
+        clauses.append("scenario = ?"); params.append(scenario)
+    where = "WHERE " + " AND ".join(clauses)
+
+    rows = conn.execute(
+        f"""
+        SELECT team_name, dataset, scenario, recall_at_10, qps,
+               latency_median_ms, latency_p99_ms, build_time_s,
+               peak_mem_mb, n_dist_build, n_dist_queries
+        FROM   runs
+        {where}
+        ORDER  BY scenario, recall_at_10 DESC, qps DESC
+        """,
+        params,
+    ).fetchall()
+
+    if not rows:
+        print("No successful runs found.")
+        return
+
+    header = (
+        f"{'Rank':<5} {'Team':<18} {'Scenario':<18} "
+        f"{'R@10':>7} {'QPS':>9} {'Med ms':>8} {'P99 ms':>8} "
+        f"{'Bld s':>7} {'Mem MB':>8} {'DistBld':>10} {'DistQry':>10}"
+    )
+    sep = "-" * len(header)
+    print("\n" + "=" * len(header))
+    print(" LEADERBOARD")
+    print("=" * len(header))
+    print(header)
+    print(sep)
+
+    def _f(v, fmt):
+        return format(v, fmt) if v is not None else "N/A"
+
+    current_scenario = None
+    rank = 0
+    for team, ds, scen, rec10, qps, med, p99, build, mem, nd_b, nd_q in rows:
+        if scen != current_scenario:
+            if current_scenario is not None:
+                print(sep)
+            current_scenario = scen
+            rank = 0
+        rank += 1
+        print(
+            f"{rank:<5} {team:<18} {scen:<18} "
+            f"{_f(rec10,'.4f'):>7} {_f(qps,'.1f'):>9} "
+            f"{_f(med,'.3f'):>8} {_f(p99,'.3f'):>8} "
+            f"{_f(build,'.2f'):>7} {_f(mem,'.0f'):>8} "
+            f"{_f(nd_b,'d') if nd_b is not None else 'N/A':>10} "
+            f"{_f(nd_q,'d') if nd_q is not None else 'N/A':>10}"
+        )
+    print("=" * len(header) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="NNS Competition Evaluator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("evaluate", help="Evaluate a single submission")
+    p.add_argument("--team",    required=True)
+    p.add_argument("--image",   required=True)
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--db",      default=DEFAULT_DB)
+    p.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=int)
+    p.add_argument("--k", nargs="+", type=int, default=[1, 10, 100])
+
+    p = sub.add_parser("batch", help="Evaluate all submissions from a JSON config")
+    p.add_argument("--config",  required=True)
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--db",      default=DEFAULT_DB)
+    p.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=int)
+
+    p = sub.add_parser("leaderboard", help="Print the current leaderboard")
+    p.add_argument("--db",       default=DEFAULT_DB)
+    p.add_argument("--dataset",  default=None)
+    p.add_argument("--scenario", default=None)
+
+    return parser
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    args = build_parser().parse_args()
+    conn = open_db(args.db)
+
+    if args.command == "leaderboard":
+        print_leaderboard(conn,
+                          getattr(args, "dataset", None),
+                          getattr(args, "scenario", None))
+        return
+
+    client = docker.from_env()
+
+    if args.command == "evaluate":
+        evaluate(conn=conn, client=client, team_name=args.team,
+                 docker_image=args.image, dataset_path=args.dataset,
+                 k_values=args.k, timeout=args.timeout)
+    elif args.command == "batch":
+        batch_evaluate(conn=conn, client=client, config_path=args.config,
+                       dataset_path=args.dataset, timeout=args.timeout)
+
+
+if __name__ == "__main__":
+    main()
