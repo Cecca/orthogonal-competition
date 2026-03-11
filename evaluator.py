@@ -133,15 +133,6 @@ def _empty_row(team, image, dataset, scenario, timestamp) -> dict:
 # Metrics
 # ---------------------------------------------------------------------------
 
-# TODO: change how we compute the recall
-def recall_at_k(true_neighbors: np.ndarray, pred_neighbors: np.ndarray, k: int) -> float:
-    n = true_neighbors.shape[0]
-    hits = sum(
-        len(set(true_neighbors[i, :k].tolist()) & set(pred_neighbors[i, :k].tolist()))
-        for i in range(n)
-    )
-    return hits / (n * k)
-
 
 def recalls(true_distances: np.ndarray, predicted_distances: np.ndarray, k: int) -> np.ndarray:
     def compute_recall(td, pd):
@@ -152,12 +143,6 @@ def recalls(true_distances: np.ndarray, predicted_distances: np.ndarray, k: int)
         compute_recall(true_distances[i], predicted_distances[i])
         for i in range(true_distances.shape[0])
     ])
-
-
-
-# def compute_all_recalls(true_nb, pred_nb, k_values):
-#     max_k = min(true_nb.shape[1], pred_nb.shape[1])
-#     return {k: recall_at_k(true_nb, pred_nb, k) for k in k_values if k <= max_k}
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +350,7 @@ def evaluate(
     team_name: str,
     docker_image: str,
     dataset_path: str,
-    k_values: list[int] = (1, 10, 100),
+    k: int = 100,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> list[dict]:
     log = logging.getLogger(__name__)
@@ -397,7 +382,6 @@ def evaluate(
         insert_run(conn, row)
         return [row]
 
-    max_k = max(k_values)
     results = []
 
     for scenario_name in scenarios:
@@ -413,7 +397,7 @@ def evaluate(
                 dataset_filename=dataset_path.name,
                 dataset_name=dataset_name,
                 scenario_name=scenario_name,
-                k=max_k,
+                k=k,
                 timeout=timeout,
             )
 
@@ -487,7 +471,7 @@ def evaluate(
                 continue
 
             # -- Metrics --
-            avg_recall = recalls(true_distances, predicted_distances, max_k).mean()
+            avg_recall = recalls(true_distances, predicted_distances, k).mean()
             total_qt = float(query_times.sum())
             qps      = n_test / total_qt if total_qt > 0 else 0.0
             lat_ms   = query_times * 1e3
@@ -626,7 +610,7 @@ def build_parser():
     p.add_argument("--dataset", required=True)
     p.add_argument("--db",      default=DEFAULT_DB)
     p.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=int)
-    p.add_argument("--k", nargs="+", type=int, default=[1, 10, 100])
+    p.add_argument("--k", type=int, default=100)
 
     p = sub.add_parser("batch", help="Evaluate all submissions from a JSON config")
     p.add_argument("--config",  required=True)
@@ -662,7 +646,7 @@ def main():
     if args.command == "evaluate":
         evaluate(conn=conn, client=client, team_name=args.team,
                  docker_image=args.image, dataset_path=args.dataset,
-                 k_values=args.k, timeout=args.timeout)
+                 k=args.k, timeout=args.timeout)
     elif args.command == "batch":
         batch_evaluate(conn=conn, client=client, config_path=args.config,
                        dataset_path=args.dataset, timeout=args.timeout)
