@@ -27,4 +27,12 @@ scenarios:
     default:
       index_params: {efConstruction: 100, M: 16}
       query_params: {ef: 50}
+  fast:
+    default:
+      index_params: {efConstruction: 100, M: 16}
+      query_params: {ef: 50}
+  memory:
+    default:
+      index_params: {efConstruction: 100, M: 16}
+      query_params: {ef: 50}
 

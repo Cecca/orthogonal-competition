@@ -54,7 +54,37 @@ The evaluator:
      thread to record the true peak RSS (cgroup-based, includes all C heap).
   4. Reads the flat results.hdf5 written by the harness and computes metrics.
   5. Stores one DB row per scenario.
+
+
+Championships
+--------
+
+Submissions are ranked in the following championships:
+
+- _Sherlock Holmes_: the fastest approach achieving average recall above 0.95 wins
+- _Bianconiglio_: the fastest approach achieving average recall above 0.8 wins
+- _Dory_: the approach using the least amount of memory while achieving recall above 0.95,
+  while at the same time not taking more than twice the time of the
+  [`faiss-hnsw`](https://github.com/Cecca/orthogonal-competition/tree/main/competitors/faiss-hnsw)
+  baseline with parameters `efConstruction: 100, M: 16, ef: 50`.
+- _Marie Kondo_: the fastest approach at building the index, in a configuration that achieves at least 0.95 recall
+- _Paperone_: the approache making the fewest distance computations, with an average recall at least 0.95.
+  For the purpose of this championship, only _full Euclidean distance computations_ count.
+  That is, sketches and product quantization (and similar techniques) _do not_ count towards the distance count.
+
   
+Scenarios
+---------
+
+The submissions will be run in different scenarios:
+
+- `high_recall`: submissions should aim for a recall of at least 0.95. This scenario
+  is used for the _Sherlock Holmes_, _Marie Kondo_, and _Paperone_ prizes;
+- `fast`: submissions should aim for a recall of at least 0.8. This scenario determines
+  the _Bianconiglio_ prize;
+- `memory`: submissions should aim for a recall of at least 0.95. This scenario
+  is used for the _Dory_ prize.
+
 
 
 

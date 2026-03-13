@@ -30,4 +30,19 @@ scenarios:
     landmark-nomic:
       index_params: {ef_construction: 120, M: 20}
       query_params: {ef_search: 60}
+  fast:
+    default:
+      index_params: {ef_construction: 100, M: 16}
+      query_params: {ef_search: 50}
+    landmark-nomic:
+      index_params: {ef_construction: 120, M: 20}
+      query_params: {ef_search: 60}
+  memory:
+    default:
+      index_params: {ef_construction: 100, M: 16}
+      query_params: {ef_search: 50}
+    landmark-nomic:
+      index_params: {ef_construction: 120, M: 20}
+      query_params: {ef_search: 60}
+
 
