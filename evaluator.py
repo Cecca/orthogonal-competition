@@ -8,16 +8,6 @@ Each student provides a Docker image that inherits from nns-competition/base.
 Students implement algorithm.py (fit / query / get_n_distances) and
 scenarios.yaml (one entry per parameter configuration to evaluate).
 
-The evaluator:
-  1. Extracts scenarios.yaml from the image (without running it) to discover
-     scenario names.
-  2. Spawns one fresh container per scenario, passing SCENARIO_NAME so the
-     harness runs exactly that configuration.
-  3. While the container runs, polls Docker's memory stats in a background
-     thread to record the true peak RSS (cgroup-based, includes all C heap).
-  4. Reads the flat results.hdf5 written by the harness and computes metrics.
-  5. Stores one DB row per scenario.
-
 Usage
 -----
   python evaluator.py evaluate --team alice --image alice/nns:latest \\
