@@ -84,12 +84,21 @@ CREATE TABLE IF NOT EXISTS runs (
     avg_recall          REAL,
     extra_metrics       TEXT     -- JSON blob
 );
+
+CREATE TABLE IF NOT EXISTS detail (
+    run_id              INTEGER NOT NULL,
+    query_index         INTEGER NOT NULL,
+    query_time_s        REAL,
+    query_recall        REAL,
+
+    FOREIGN KEY(run_id) REFERENCES runs(id)
+);
 """
 
 
 def open_db(path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
-    conn.execute(_CREATE_SCHEMA)
+    conn.executescript(_CREATE_SCHEMA)
     conn.commit()
     return conn
 
@@ -115,6 +124,24 @@ def insert_run(conn: sqlite3.Connection, row: dict) -> int:
     )
     conn.commit()
     return cur.lastrowid
+
+
+def insert_detail(conn: sqlite3.Connection, run_id: int, times: np.ndarray, all_recalls: np.ndarray) -> None:
+    rows = [
+        {"run_id": run_id, "query_index": i, "query_time_s": times[i], "query_recall": all_recalls[i]}
+        for i in range(times.shape[0])
+    ]
+    conn.executemany(
+        """
+        INSERT INTO detail (
+            run_id, query_index, query_time_s, query_recall
+        ) VALUES (
+            :run_id, :query_index, :query_time_s, :query_recall
+        )
+        """,
+        rows
+    )
+    conn.commit()
 
 
 def _empty_row(team, image, dataset, scenario, timestamp) -> dict:
@@ -426,7 +453,7 @@ def evaluate(
                 with h5py.File(results_file, "r") as f:
                     pred_neighbors  = f["neighbors"][:]
                     build_time      = float(f["build_time"][()])
-                    query_times     = f["query_times"][:]
+                    query_times_s   = f["query_times"][:]
                     n_dist_queries  = int(f["n_dist_queries"][()])
                     index_mem_mb  = int(f["index_mem_mb"][()])
             except Exception as exc:
@@ -462,24 +489,26 @@ def evaluate(
                 insert_run(conn, row)
                 results.append(row)
                 continue
-            if query_times.shape[0] != n_test:
+            if query_times_s.shape[0] != n_test:
                 row["error_message"] = (
-                    f"'query_times' has {query_times.shape[0]} entries, expected {n_test}."
+                    f"'query_times' has {query_times_s.shape[0]} entries, expected {n_test}."
                 )
                 insert_run(conn, row)
                 results.append(row)
                 continue
 
             # -- Metrics --
-            avg_recall = recalls(true_distances, predicted_distances, k).mean()
-            total_qt = float(query_times.sum())
-            qps      = n_test / total_qt if total_qt > 0 else 0.0
-            lat_ms   = query_times * 1e3
+            all_recalls = recalls(true_distances, predicted_distances, k)
+            avg_recall = all_recalls.mean()
+            total_qt_s = float(query_times_s.sum())
+            qps      = n_test / total_qt_s
+            lat_ms   = query_times_s * 1e3
+            ic(total_qt_s, qps, n_test)
 
             row.update(
                 status="success",
                 build_time_s=build_time,
-                total_query_time_s=total_qt,
+                total_query_time_s=total_qt_s,
                 qps=qps,
                 n_dist_queries=n_dist_queries,
                 index_mem_mb=index_mem_mb,
@@ -506,6 +535,7 @@ def evaluate(
             )
 
         run_id = insert_run(conn, row)
+        insert_detail(conn, run_id, query_times_s, all_recalls)
         log.info("Saved run id=%d  scenario=%s", run_id, scenario_name)
         results.append(row)
 
