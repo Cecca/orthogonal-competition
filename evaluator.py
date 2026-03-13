@@ -12,9 +12,6 @@ Usage
 -----
   python evaluator.py evaluate --team alice --image alice/nns:latest \\
                                 --dataset data/sift-128-euclidean.hdf5
-  python evaluator.py batch    --config submissions.json \\
-                                --dataset data/sift-128-euclidean.hdf5
-  python evaluator.py leaderboard [--dataset NAME] [--scenario NAME]
 """
 
 from __future__ import annotations
@@ -44,11 +41,9 @@ import yaml
 # ---------------------------------------------------------------------------
 
 DEFAULT_DB      = "results.db"
-DEFAULT_TIMEOUT = 600          # seconds per container run
+DEFAULT_TIMEOUT = 1800          # seconds per container run
 CONTAINER_DATA_MOUNT    = "/competition/data"
 CONTAINER_RESULTS_MOUNT = "/competition/results"
-MEMORY_LIMIT = "8g"
-CPU_QUOTA    = 4 * 10**9       # 4 vCPUs in nano-CPUs
 MEM_POLL_INTERVAL = 0.5        # seconds between memory stat polls
 
 # ---------------------------------------------------------------------------
@@ -533,86 +528,6 @@ def evaluate(
 
 
 # ---------------------------------------------------------------------------
-# Batch mode
-# ---------------------------------------------------------------------------
-
-def batch_evaluate(conn, client, config_path, dataset_path, timeout=DEFAULT_TIMEOUT):
-    with open(config_path) as f:
-        submissions = json.load(f)
-    log = logging.getLogger(__name__)
-    log.info("Batch: %d submission(s).", len(submissions))
-    for i, sub in enumerate(submissions, 1):
-        log.info("--- Submission %d/%d ---", i, len(submissions))
-        evaluate(conn=conn, client=client, team_name=sub["team"],
-                 docker_image=sub["image"], dataset_path=dataset_path,
-                 timeout=timeout)
-
-
-# ---------------------------------------------------------------------------
-# Leaderboard
-# ---------------------------------------------------------------------------
-
-def print_leaderboard(conn, dataset=None, scenario=None):
-    clauses = ["status = 'success'"]
-    params  = []
-    if dataset:
-        clauses.append("dataset = ?");  params.append(dataset)
-    if scenario:
-        clauses.append("scenario = ?"); params.append(scenario)
-    where = "WHERE " + " AND ".join(clauses)
-
-    rows = conn.execute(
-        f"""
-        SELECT team_name, dataset, scenario, avg_recall, qps,
-               latency_median_ms, latency_p99_ms, build_time_s,
-               peak_mem_mb, n_dist_build, n_dist_queries
-        FROM   runs
-        {where}
-        ORDER  BY scenario, avg_recall DESC, qps DESC
-        """,
-        params,
-    ).fetchall()
-
-    if not rows:
-        print("No successful runs found.")
-        return
-
-    header = (
-        f"{'Rank':<5} {'Team':<18} {'Scenario':<18} "
-        f"{'Recall':>7} {'QPS':>9} {'Med ms':>8} {'P99 ms':>8} "
-        f"{'Bld s':>7} {'Mem MB':>8} {'DistBld':>10} {'DistQry':>10}"
-    )
-    sep = "-" * len(header)
-    print("\n" + "=" * len(header))
-    print(" LEADERBOARD")
-    print("=" * len(header))
-    print(header)
-    print(sep)
-
-    def _f(v, fmt):
-        return format(v, fmt) if v is not None else "N/A"
-
-    current_scenario = None
-    rank = 0
-    for team, ds, scen, recall, qps, med, p99, build, mem, nd_b, nd_q in rows:
-        if scen != current_scenario:
-            if current_scenario is not None:
-                print(sep)
-            current_scenario = scen
-            rank = 0
-        rank += 1
-        print(
-            f"{rank:<5} {team:<18} {scen:<18} "
-            f"{_f(recall,'.4f'):>7} {_f(qps,'.1f'):>9} "
-            f"{_f(med,'.3f'):>8} {_f(p99,'.3f'):>8} "
-            f"{_f(build,'.2f'):>7} {_f(mem,'.0f'):>8} "
-            f"{_f(nd_b,'d') if nd_b is not None else 'N/A':>10} "
-            f"{_f(nd_q,'d') if nd_q is not None else 'N/A':>10}"
-        )
-    print("=" * len(header) + "\n")
-
-
-# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -632,17 +547,6 @@ def build_parser():
     p.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=int)
     p.add_argument("--k", type=int, default=100)
 
-    p = sub.add_parser("batch", help="Evaluate all submissions from a JSON config")
-    p.add_argument("--config",  required=True)
-    p.add_argument("--dataset", required=True)
-    p.add_argument("--db",      default=DEFAULT_DB)
-    p.add_argument("--timeout", default=DEFAULT_TIMEOUT, type=int)
-
-    p = sub.add_parser("leaderboard", help="Print the current leaderboard")
-    p.add_argument("--db",       default=DEFAULT_DB)
-    p.add_argument("--dataset",  default=None)
-    p.add_argument("--scenario", default=None)
-
     return parser
 
 
@@ -655,11 +559,7 @@ def main():
     args = build_parser().parse_args()
     conn = open_db(args.db)
 
-    if args.command == "leaderboard":
-        print_leaderboard(conn,
-                          getattr(args, "dataset", None),
-                          getattr(args, "scenario", None))
-        return
+    # TODO: print leaderbords
 
     client = docker.from_env()
 
@@ -667,10 +567,6 @@ def main():
         evaluate(conn=conn, client=client, team_name=args.team,
                  docker_image=args.image, dataset_path=args.dataset,
                  k=args.k, timeout=args.timeout)
-    elif args.command == "batch":
-        batch_evaluate(conn=conn, client=client, config_path=args.config,
-                       dataset_path=args.dataset, timeout=args.timeout)
-
 
 if __name__ == "__main__":
     main()
